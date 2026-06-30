@@ -54,7 +54,7 @@ jobs:
           set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git fetch origin "+refs/heads/*:refs/remotes/origin/*"
+          git fetch --prune origin "+refs/heads/*:refs/remotes/origin/*"
           git remote add upstream "${UPSTREAM_URL}" 2>/dev/null || git remote set-url upstream "${UPSTREAM_URL}"
           git fetch upstream --prune
           failed=()
@@ -112,7 +112,7 @@ jobs:
           set -euo pipefail
           run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           title="upstream-sync: could not reconcile with ${UPSTREAM_SLUG} — manual attention needed"
-          body="\`upstream-sync\` could not reconcile with \`${UPSTREAM_SLUG}\`: **${FAILED_BRANCHES}**. The merge was aborted and this fork's history is untouched (never force-pushed/reset). Reconcile by hand (resolve a conflict locally, or rebase the fork commits onto upstream). Run: ${run_url}"
+          body="\`upstream-sync\` could not reconcile with \`${UPSTREAM_SLUG}\`: **${FAILED_BRANCHES}** (each entry states its cause — merge conflict, non-conflict merge failure, push failure, or missing branch). No fork history was rewritten (never force-pushed/reset); any in-progress merge was aborted. Reconcile by hand (resolve a conflict, fix the push permission, or rebase the fork commits onto upstream). Run: ${run_url}"
           # `// empty` so an empty result is the empty string (not the literal "null"),
           # making the create path run on the first failure.
           existing=$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open --search "in:title upstream-sync could not reconcile" --json number --jq '.[0].number // empty' || true)
