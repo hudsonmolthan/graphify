@@ -60,25 +60,24 @@ jobs:
           failed=()
           for b in ${BRANCHES}; do
             echo "::group::sync ${b} <- upstream/${b}"
-            # Check out the fork's branch if it exists; otherwise seed a brand-new
-            # tracked branch straight from upstream (handles the first sync as the
-            # fork grows, so a not-yet-existing fork branch doesn't abort the job).
+            # Resolve a base WITHOUT aborting the job (set -e): prefer the fork's
+            # branch, else seed from upstream, else record the failure and skip — so
+            # a branch missing on both remotes still reaches the reporting step.
             if git show-ref --verify --quiet "refs/remotes/origin/${b}"; then
               git checkout -B "${b}" "origin/${b}"
-            else
+            elif git show-ref --verify --quiet "refs/remotes/upstream/${b}"; then
               echo "note: ${b} not on the fork yet — seeding from upstream/${b}"
               git checkout -B "${b}" "upstream/${b}"
-            fi
-            # Fast-forward when possible, otherwise a real merge commit (keeps the
-            # fork's own commits). No --force / --hard anywhere.
-            if git merge --no-edit "upstream/${b}"; then
-              git push origin "${b}"
-              echo "ok: ${b} synced from upstream (ff or merge) and pushed"
             else
+              echo "::error::${b} not found on origin or upstream — skipping"
+              failed+=("${b}: not found on origin or upstream")
+              echo "::endgroup::"; continue
+            fi
+            # Reconcile: fast-forward when possible, else a real merge commit (keeps
+            # the fork's own commits). No --force / --hard anywhere.
+            if ! git merge --no-edit "upstream/${b}"; then
               # Distinguish a real merge conflict (unmerged paths) from any other
-              # git-merge failure (missing upstream/<b>, unrelated histories, repo
-              # state, …) so the issue message is accurate. Both fail-safe; neither
-              # force-pushes or resets.
+              # git-merge failure (unrelated histories, repo state, …).
               if git ls-files -u | grep -q .; then
                 echo "::error::merge CONFLICT syncing ${b} <- upstream/${b}"
                 failed+=("${b}: merge conflict")
@@ -87,6 +86,15 @@ jobs:
                 failed+=("${b}: merge failed (non-conflict — see run log)")
               fi
               git merge --abort 2>/dev/null || true
+              echo "::endgroup::"; continue
+            fi
+            # Push — guarded so a push failure (branch protection / permission /
+            # network) records into failed[] instead of aborting before reporting.
+            if git push origin "${b}"; then
+              echo "ok: ${b} synced from upstream (ff or merge) and pushed"
+            else
+              echo "::error::push failed for ${b}"
+              failed+=("${b}: push failed (branch protection / permission / network?)")
             fi
             echo "::endgroup::"
           done
