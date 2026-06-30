@@ -1,22 +1,21 @@
 name: upstream-sync
 
 # Keep this fork (hudsonmolthan/graphify) current with its upstream
-# (safishamsi/graphify) by FAST-FORWARD-ONLY sync.
+# (safishamsi/graphify) via a MERGE sync — so the fork stays zero-touch-current
+# even though its tracked branches carry fork-only commits (e.g. this workflow
+# itself, which was merged onto v8).
 #
 # Design principle — "currency at the source, stability at the consumer":
-# this fork tracks upstream so it is always current, but it does NOT upgrade
-# any consumer. viralclip-studio installs an EXACT PINNED graphify version and
+# the fork tracks upstream so it is always current, but does NOT upgrade any
+# consumer. viralclip-studio installs an EXACT PINNED graphify version and
 # upgrades only via a deliberate, smoke-gated event — this workflow never
 # touches studio.
 #
-# Safety: `gh repo sync` performs a fast-forward update unless the force flag
-# is set, which this workflow NEVER sets. A diverged branch therefore fails the
-# run (and opens or comments an issue) instead of being hard-reset. No history
-# is ever rewritten on the fork.
-#
-# Fallback (if a future runner lacks `gh repo sync --branch`): add upstream as a
-# remote, `git fetch upstream`, `git merge --ff-only upstream/<b>`, `git push` —
-# same ff-only guarantee, no force.
+# Why merge (not fast-forward-only): once a fork-only commit lives on a tracked
+# branch, a fast-forward from upstream is impossible, so an ff-only sync would
+# fail on every upstream advance. A merge keeps the fork current AND preserves
+# the fork's own commits. It NEVER rewrites history (no force-push, no reset):
+# on a TRUE merge conflict it aborts, opens or comments an issue, and fails the run.
 
 on:
   schedule:
@@ -32,7 +31,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  UPSTREAM: safishamsi/graphify
+  UPSTREAM_URL: https://github.com/safishamsi/graphify.git
+  UPSTREAM_SLUG: safishamsi/graphify
   # Space-separated list of fork branches to keep in sync with the same-named
   # upstream branch. Add branches here as the fork grows (mapping is by name).
   BRANCHES: "v8"
@@ -41,50 +41,60 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Fast-forward-only sync each tracked branch from upstream
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # full history so merges resolve correctly
+          # persisted GITHUB_TOKEN credentials let the later `git push` work
+
+      - name: Merge-sync each tracked branch from upstream (never force-push)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          dest="${GITHUB_REPOSITORY}"
-          failed=()
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin "+refs/heads/*:refs/remotes/origin/*"
+          git remote add upstream "${UPSTREAM_URL}" 2>/dev/null || git remote set-url upstream "${UPSTREAM_URL}"
+          git fetch upstream --prune
+          conflicted=()
           for b in ${BRANCHES}; do
-            echo "::group::sync ${b} <- ${UPSTREAM}:${b}"
-            # ff-only: no force flag is ever passed, so a diverged branch exits
-            # non-zero here rather than being hard-reset.
-            if gh repo sync "${dest}" --source "${UPSTREAM}" --branch "${b}"; then
-              echo "ok: ${b} fast-forwarded or already up to date"
+            echo "::group::sync ${b} <- upstream/${b}"
+            git checkout -B "${b}" "origin/${b}"
+            # Fast-forward when possible, otherwise a real merge commit (keeps the
+            # fork's own commits). No --force / --hard anywhere.
+            if git merge --no-edit "upstream/${b}"; then
+              git push origin "${b}"
+              echo "ok: ${b} synced from upstream (ff or merge) and pushed"
             else
-              echo "::error::ff-only sync failed for ${b} (likely diverged from ${UPSTREAM}:${b})"
-              failed+=("${b}")
+              echo "::error::true merge conflict syncing ${b} from upstream/${b}"
+              git merge --abort || true
+              conflicted+=("${b}")
             fi
             echo "::endgroup::"
           done
-          if [ ${#failed[@]} -ne 0 ]; then
-            echo "DIVERGED=1" >> "${GITHUB_ENV}"
-            echo "FAILED_BRANCHES=${failed[*]}" >> "${GITHUB_ENV}"
+          if [ ${#conflicted[@]} -ne 0 ]; then
+            echo "CONFLICTED=1" >> "${GITHUB_ENV}"
+            echo "CONFLICTED_BRANCHES=${conflicted[*]}" >> "${GITHUB_ENV}"
           fi
 
-      - name: On divergence, open/comment an issue (never force-push)
-        if: ${{ env.DIVERGED == '1' }}
+      - name: On a true conflict, open/comment an issue (never force-push)
+        if: ${{ env.CONFLICTED == '1' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          title="upstream-sync: branches diverged from ${UPSTREAM} — manual reconcile needed"
-          body="\`upstream-sync\` could not fast-forward these branches from \`${UPSTREAM}\`: **${FAILED_BRANCHES}**.
-
-          A fast-forward was impossible (the fork branch carries commits not on upstream). This workflow never rewrites fork history, so it stopped. Reconcile by hand (rebase the fork branch onto upstream, or accept the divergence). Run: ${run_url}"
-          existing=$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open --search "in:title upstream-sync diverged" --json number --jq '.[0].number' || true)
+          title="upstream-sync: merge conflict with ${UPSTREAM_SLUG} — manual reconcile needed"
+          body="\`upstream-sync\` hit a real merge conflict reconciling **${CONFLICTED_BRANCHES}** with \`${UPSTREAM_SLUG}\`. The merge was aborted and this fork's history is untouched (never force-pushed). Reconcile by hand (resolve the conflict locally, or rebase the fork commits onto upstream). Run: ${run_url}"
+          existing=$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open --search "in:title upstream-sync merge conflict" --json number --jq '.[0].number' || true)
           if [ -n "${existing:-}" ]; then
             gh issue comment "${existing}" --repo "${GITHUB_REPOSITORY}" --body "${body}"
           else
             gh issue create --repo "${GITHUB_REPOSITORY}" --title "${title}" --body "${body}"
           fi
 
-      - name: Fail the run if any branch diverged
-        if: ${{ env.DIVERGED == '1' }}
+      - name: Fail the run on conflict
+        if: ${{ env.CONFLICTED == '1' }}
         run: |
-          echo "One or more branches diverged from ${UPSTREAM}; see the issue above."
+          echo "Merge conflict with ${UPSTREAM_SLUG}; see the issue above."
           exit 1
