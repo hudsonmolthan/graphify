@@ -57,7 +57,7 @@ jobs:
           git fetch origin "+refs/heads/*:refs/remotes/origin/*"
           git remote add upstream "${UPSTREAM_URL}" 2>/dev/null || git remote set-url upstream "${UPSTREAM_URL}"
           git fetch upstream --prune
-          conflicted=()
+          failed=()
           for b in ${BRANCHES}; do
             echo "::group::sync ${b} <- upstream/${b}"
             # Check out the fork's branch if it exists; otherwise seed a brand-new
@@ -75,35 +75,47 @@ jobs:
               git push origin "${b}"
               echo "ok: ${b} synced from upstream (ff or merge) and pushed"
             else
-              echo "::error::true merge conflict syncing ${b} from upstream/${b}"
-              git merge --abort || true
-              conflicted+=("${b}")
+              # Distinguish a real merge conflict (unmerged paths) from any other
+              # git-merge failure (missing upstream/<b>, unrelated histories, repo
+              # state, …) so the issue message is accurate. Both fail-safe; neither
+              # force-pushes or resets.
+              if git ls-files -u | grep -q .; then
+                echo "::error::merge CONFLICT syncing ${b} <- upstream/${b}"
+                failed+=("${b}: merge conflict")
+              else
+                echo "::error::git merge FAILED (non-conflict) for ${b} <- upstream/${b}"
+                failed+=("${b}: merge failed (non-conflict — see run log)")
+              fi
+              git merge --abort 2>/dev/null || true
             fi
             echo "::endgroup::"
           done
-          if [ ${#conflicted[@]} -ne 0 ]; then
-            echo "CONFLICTED=1" >> "${GITHUB_ENV}"
-            echo "CONFLICTED_BRANCHES=${conflicted[*]}" >> "${GITHUB_ENV}"
+          if [ ${#failed[@]} -ne 0 ]; then
+            printf -v joined '%s; ' "${failed[@]}"
+            echo "SYNC_FAILED=1" >> "${GITHUB_ENV}"
+            echo "FAILED_BRANCHES=${joined%; }" >> "${GITHUB_ENV}"
           fi
 
-      - name: On a true conflict, open/comment an issue (never force-push)
-        if: ${{ env.CONFLICTED == '1' }}
+      - name: On a sync failure, open/comment an issue (never force-push)
+        if: ${{ env.SYNC_FAILED == '1' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          title="upstream-sync: merge conflict with ${UPSTREAM_SLUG} — manual reconcile needed"
-          body="\`upstream-sync\` hit a real merge conflict reconciling **${CONFLICTED_BRANCHES}** with \`${UPSTREAM_SLUG}\`. The merge was aborted and this fork's history is untouched (never force-pushed). Reconcile by hand (resolve the conflict locally, or rebase the fork commits onto upstream). Run: ${run_url}"
-          existing=$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open --search "in:title upstream-sync merge conflict" --json number --jq '.[0].number' || true)
+          title="upstream-sync: could not reconcile with ${UPSTREAM_SLUG} — manual attention needed"
+          body="\`upstream-sync\` could not reconcile with \`${UPSTREAM_SLUG}\`: **${FAILED_BRANCHES}**. The merge was aborted and this fork's history is untouched (never force-pushed/reset). Reconcile by hand (resolve a conflict locally, or rebase the fork commits onto upstream). Run: ${run_url}"
+          # `// empty` so an empty result is the empty string (not the literal "null"),
+          # making the create path run on the first failure.
+          existing=$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open --search "in:title upstream-sync could not reconcile" --json number --jq '.[0].number // empty' || true)
           if [ -n "${existing:-}" ]; then
             gh issue comment "${existing}" --repo "${GITHUB_REPOSITORY}" --body "${body}"
           else
             gh issue create --repo "${GITHUB_REPOSITORY}" --title "${title}" --body "${body}"
           fi
 
-      - name: Fail the run on conflict
-        if: ${{ env.CONFLICTED == '1' }}
+      - name: Fail the run on a sync failure
+        if: ${{ env.SYNC_FAILED == '1' }}
         run: |
-          echo "Merge conflict with ${UPSTREAM_SLUG}; see the issue above."
+          echo "Could not reconcile with ${UPSTREAM_SLUG}; see the issue above."
           exit 1
