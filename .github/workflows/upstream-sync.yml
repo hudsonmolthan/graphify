@@ -47,8 +47,9 @@ jobs:
           # persisted GITHUB_TOKEN credentials let the later `git push` work
 
       - name: Merge-sync each tracked branch from upstream (never force-push)
-        env:
-          GH_TOKEN: ${{ github.token }}
+        # No GH_TOKEN here — this step runs only git; the push uses the
+        # actions/checkout-persisted credentials. (gh is used only in the
+        # issue-creation step below, which sets its own GH_TOKEN.)
         run: |
           set -euo pipefail
           git config user.name  "github-actions[bot]"
@@ -59,7 +60,15 @@ jobs:
           conflicted=()
           for b in ${BRANCHES}; do
             echo "::group::sync ${b} <- upstream/${b}"
-            git checkout -B "${b}" "origin/${b}"
+            # Check out the fork's branch if it exists; otherwise seed a brand-new
+            # tracked branch straight from upstream (handles the first sync as the
+            # fork grows, so a not-yet-existing fork branch doesn't abort the job).
+            if git show-ref --verify --quiet "refs/remotes/origin/${b}"; then
+              git checkout -B "${b}" "origin/${b}"
+            else
+              echo "note: ${b} not on the fork yet — seeding from upstream/${b}"
+              git checkout -B "${b}" "upstream/${b}"
+            fi
             # Fast-forward when possible, otherwise a real merge commit (keeps the
             # fork's own commits). No --force / --hard anywhere.
             if git merge --no-edit "upstream/${b}"; then
