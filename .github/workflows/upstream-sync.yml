@@ -1,0 +1,90 @@
+name: upstream-sync
+
+# Keep this fork (hudsonmolthan/graphify) current with its upstream
+# (safishamsi/graphify) by FAST-FORWARD-ONLY sync.
+#
+# Design principle — "currency at the source, stability at the consumer":
+# this fork tracks upstream so it is always current, but it does NOT upgrade
+# any consumer. viralclip-studio installs an EXACT PINNED graphify version and
+# upgrades only via a deliberate, smoke-gated event — this workflow never
+# touches studio.
+#
+# Safety: `gh repo sync` performs a fast-forward update unless the force flag
+# is set, which this workflow NEVER sets. A diverged branch therefore fails the
+# run (and opens or comments an issue) instead of being hard-reset. No history
+# is ever rewritten on the fork.
+#
+# Fallback (if a future runner lacks `gh repo sync --branch`): add upstream as a
+# remote, `git fetch upstream`, `git merge --ff-only upstream/<b>`, `git push` —
+# same ff-only guarantee, no force.
+
+on:
+  schedule:
+    - cron: '17 7 * * *'   # daily 07:17 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: safishamsi/graphify
+  # Space-separated list of fork branches to keep in sync with the same-named
+  # upstream branch. Add branches here as the fork grows (mapping is by name).
+  BRANCHES: "v8"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fast-forward-only sync each tracked branch from upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          dest="${GITHUB_REPOSITORY}"
+          failed=()
+          for b in ${BRANCHES}; do
+            echo "::group::sync ${b} <- ${UPSTREAM}:${b}"
+            # ff-only: no force flag is ever passed, so a diverged branch exits
+            # non-zero here rather than being hard-reset.
+            if gh repo sync "${dest}" --source "${UPSTREAM}" --branch "${b}"; then
+              echo "ok: ${b} fast-forwarded or already up to date"
+            else
+              echo "::error::ff-only sync failed for ${b} (likely diverged from ${UPSTREAM}:${b})"
+              failed+=("${b}")
+            fi
+            echo "::endgroup::"
+          done
+          if [ ${#failed[@]} -ne 0 ]; then
+            echo "DIVERGED=1" >> "${GITHUB_ENV}"
+            echo "FAILED_BRANCHES=${failed[*]}" >> "${GITHUB_ENV}"
+          fi
+
+      - name: On divergence, open/comment an issue (never force-push)
+        if: ${{ env.DIVERGED == '1' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          title="upstream-sync: branches diverged from ${UPSTREAM} — manual reconcile needed"
+          body="\`upstream-sync\` could not fast-forward these branches from \`${UPSTREAM}\`: **${FAILED_BRANCHES}**.
+
+          A fast-forward was impossible (the fork branch carries commits not on upstream). This workflow never rewrites fork history, so it stopped. Reconcile by hand (rebase the fork branch onto upstream, or accept the divergence). Run: ${run_url}"
+          existing=$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open --search "in:title upstream-sync diverged" --json number --jq '.[0].number' || true)
+          if [ -n "${existing:-}" ]; then
+            gh issue comment "${existing}" --repo "${GITHUB_REPOSITORY}" --body "${body}"
+          else
+            gh issue create --repo "${GITHUB_REPOSITORY}" --title "${title}" --body "${body}"
+          fi
+
+      - name: Fail the run if any branch diverged
+        if: ${{ env.DIVERGED == '1' }}
+        run: |
+          echo "One or more branches diverged from ${UPSTREAM}; see the issue above."
+          exit 1
