@@ -2598,16 +2598,37 @@ def _csharp_extra_walk(node, source: bytes, file_nid: str, stem: str, str_path: 
 
 def _swift_extra_walk(node, source: bytes, file_nid: str, stem: str, str_path: str,
                       nodes: list, edges: list, seen_ids: set, function_bodies: list,
-                      parent_class_nid: str | None, add_node_fn, add_edge_fn) -> bool:
+                      parent_class_nid: str | None, add_node_fn, add_edge_fn,
+                      ensure_named_node_fn) -> bool:
     """Handle enum_entry for Swift. Returns True if handled."""
     if node.type == "enum_entry" and parent_class_nid:
+        line = node.start_point[0] + 1
         for child in node.children:
             if child.type == "simple_identifier":
                 case_name = _read_text(child, source)
                 case_nid = _make_id(parent_class_nid, case_name)
-                line = node.start_point[0] + 1
                 add_node_fn(case_nid, case_name, line)
                 add_edge_fn(parent_class_nid, case_nid, "case_of", line)
+        # Associated-value types nest as `enum_type_parameters -> user_type ->
+        # type_identifier` (a sibling of the case-name simple_identifier). The
+        # case-name loop above never descends into them, so `case started(Session)`
+        # used to drop the Event -> Session reference entirely. Mirror the Swift
+        # property/parameter emit style: collect the type refs and emit a
+        # `references` edge from the ENUM node to each collected type.
+        for child in node.children:
+            if child.type != "enum_type_parameters":
+                continue
+            for grand in child.children:
+                if not grand.is_named:
+                    continue
+                refs: list[tuple[str, str]] = []
+                _swift_collect_type_refs(grand, source, False, refs)
+                for ref_name, role in refs:
+                    ctx = "generic_arg" if role == "generic_arg" else "type"
+                    target_nid = ensure_named_node_fn(ref_name, line)
+                    if target_nid != parent_class_nid:
+                        add_edge_fn(parent_class_nid, target_nid, "references",
+                                    line, context=ctx)
         return True
     return False
 
@@ -3426,6 +3447,37 @@ def _extract_generic(
                                             add_edge(class_nid, target, "references", line,
                                                      context="generic_arg")
 
+            # Ruby: `class Dog < Animal` puts the base class in the `superclass`
+            # field (a `<` token followed by a constant or scope_resolution).
+            # There was no Ruby branch, so every Ruby inherits edge was dropped.
+            if config.ts_module == "tree_sitter_ruby":
+                sup = node.child_by_field_name("superclass")
+                if sup is not None:
+                    base = ""
+                    for sub in sup.children:
+                        if sub.type == "constant":
+                            base = _read_text(sub, source)
+                            break
+                        if sub.type == "scope_resolution":
+                            consts = [c for c in sub.children if c.type == "constant"]
+                            if consts:
+                                base = _read_text(consts[-1], source)
+                            break
+                    if base:
+                        base_nid = _make_id(stem, base)
+                        if base_nid not in seen_ids:
+                            base_nid = _make_id(base)
+                            if base_nid not in seen_ids:
+                                nodes.append({
+                                    "id": base_nid,
+                                    "label": base,
+                                    "file_type": "code",
+                                    "source_file": "",
+                                    "source_location": "",
+                                })
+                                seen_ids.add(base_nid)
+                        add_edge(class_nid, base_nid, "inherits", line)
+
             # C#-specific: inheritance / interface implementation via base_list
             if config.ts_module == "tree_sitter_c_sharp":
                 csharp_type_params = _csharp_type_parameters_in_scope(node, source)
@@ -3482,7 +3534,7 @@ def _extract_generic(
                                                  context="generic_arg", metadata=metadata)
 
             # Java-specific: extends (superclass) / implements (interfaces) / interface-extends
-            if config.ts_module == "tree_sitter_java":
+            if config.ts_module in ("tree_sitter_java", "tree_sitter_groovy"):
                 def _emit_java_parent(base_name: str, rel: str, at_line: int) -> None:
                     if not base_name:
                         return
@@ -3637,6 +3689,7 @@ def _extract_generic(
                         continue
                     for sub in child.children:
                         base = ""
+                        template_args_node = None
                         if sub.type == "type_identifier":
                             base = _read_text(sub, source)
                         elif sub.type == "qualified_identifier":
@@ -3648,6 +3701,12 @@ def _extract_generic(
                         elif sub.type == "template_type":
                             tname = sub.child_by_field_name("name")
                             base = _read_text(tname, source) if tname else _read_text(sub, source)
+                            # The base's template_argument_list carries generic
+                            # type arguments (class Car : public Base<Dep>). The
+                            # Java handler (_emit_java_parent_type) emits these as
+                            # generic_arg references; C++ dropped them because we
+                            # only emitted the `inherits` edge on the base name.
+                            template_args_node = sub.child_by_field_name("arguments")
                         else:
                             continue
                         if not base:
@@ -3665,6 +3724,19 @@ def _extract_generic(
                                 })
                                 seen_ids.add(base_nid)
                         add_edge(class_nid, base_nid, "inherits", line)
+                        # Emit a generic_arg reference for each type argument on the
+                        # base (Base<Dep> -> Car references Dep). _cpp_collect_type_refs
+                        # handles nested/qualified args (Base<std::vector<Dep>>) too.
+                        if template_args_node is not None:
+                            arg_refs: list[tuple[str, str]] = []
+                            for arg in template_args_node.children:
+                                if arg.is_named:
+                                    _cpp_collect_type_refs(arg, source, True, arg_refs)
+                            for ref_name, _role in arg_refs:
+                                target_nid = ensure_named_node(ref_name, line)
+                                if target_nid != class_nid:
+                                    add_edge(class_nid, target_nid, "references",
+                                             line, context="generic_arg")
 
             # Find body and recurse
             body = _find_body(node, config)
@@ -3755,6 +3827,35 @@ def _extract_generic(
                          "references", line, context="field", metadata=metadata)
             return
 
+        if (config.ts_module == "tree_sitter_c_sharp"
+                and t == "property_declaration"
+                and parent_class_nid):
+            # C# auto-properties (`public Widget Main { get; set; }`) are the
+            # idiomatic way to declare state, yet only field_declaration was
+            # handled — so property types produced no references edge. Unlike a
+            # field, a property exposes its type on the node directly (no
+            # variable_declaration wrapper), so read it straight off the `type`
+            # field. Use _csharp_collect_type_refs (like the Java/PHP/Kotlin
+            # siblings) so `List<Widget>` yields both the List field ref and the
+            # Widget generic_arg ref.
+            type_node = node.child_by_field_name("type")
+            if type_node is not None:
+                line = node.start_point[0] + 1
+                refs: list[tuple[str, str, bool, str]] = []
+                _csharp_collect_type_refs(type_node, source, False, refs)
+                for ref_name, role, qualified, qualifier in refs:
+                    ctx = "generic_arg" if role == "generic_arg" else "field"
+                    target_nid = ensure_named_node(ref_name, line)
+                    if target_nid != parent_class_nid:
+                        metadata = {"ref_token": ref_name}
+                        if qualified:
+                            metadata["qualified"] = True
+                        if qualifier:
+                            metadata["ref_qualifier"] = qualifier
+                        add_edge(parent_class_nid, target_nid, "references",
+                                 line, context=ctx, metadata=metadata)
+            return
+
         if (config.ts_module == "tree_sitter_java"
                 and t == "field_declaration"
                 and parent_class_nid):
@@ -3837,7 +3938,7 @@ def _extract_generic(
             return
 
         if (config.ts_module == "tree_sitter_scala"
-                and t == "val_definition"
+                and t in ("val_definition", "var_definition")
                 and parent_class_nid):
             type_node = node.child_by_field_name("type")
             if type_node is not None:
@@ -4038,8 +4139,14 @@ def _extract_generic(
                         break
                 if params_container is not None:
                     for p in params_container.children:
-                        if p.type != "simple_parameter":
+                        # PHP 8 constructor property promotion (`__construct(private
+                        # Repo $repo)`) parses the promoted param as
+                        # property_promotion_parameter, not simple_parameter. Its
+                        # type sits in the same direct named child shape, so accept
+                        # both here; a promoted param is additionally a class field.
+                        if p.type not in ("simple_parameter", "property_promotion_parameter"):
                             continue
+                        is_promoted = p.type == "property_promotion_parameter"
                         type_node = None
                         for sub in p.children:
                             if sub.type in ("named_type", "primitive_type", "nullable_type",
@@ -4053,6 +4160,13 @@ def _extract_generic(
                             target_nid = ensure_named_node(ref_name, line)
                             if target_nid != func_nid:
                                 add_edge(func_nid, target_nid, "references", line, context=ctx)
+                            # A promoted param declares a real class field; mirror
+                            # the property_declaration field-context edge so the
+                            # type is discoverable as a class field too.
+                            if is_promoted and parent_class_nid and target_nid != parent_class_nid:
+                                fctx = "generic_arg" if role == "generic_arg" else "field"
+                                add_edge(parent_class_nid, target_nid, "references",
+                                         line, context=fctx)
                 return_node = _php_method_return_type_node(node)
                 if return_node is not None:
                     refs = []
@@ -4276,7 +4390,8 @@ def _extract_generic(
         if config.ts_module == "tree_sitter_swift":
             if _swift_extra_walk(node, source, file_nid, stem, str_path,
                                   nodes, edges, seen_ids, function_bodies,
-                                  parent_class_nid, add_node, add_edge):
+                                  parent_class_nid, add_node, add_edge,
+                                  ensure_named_node):
                 return
 
         # Python's `@property` / `@staticmethod` / `@classmethod` wrap the
@@ -4328,22 +4443,17 @@ def _extract_generic(
     # receiver_type so the cross-file pass resolves `var.method` by type (#ruby).
     ruby_var_types: dict[str, dict[str, str | None]] = {}
 
-    def _emit_indirect_ref(ident, scope_nid: str, enclosing_locals, context: str) -> None:
-        """A function referenced BY NAME — passed as a call argument, or listed as a
-        value in a dispatch table — is an indirect dependency of ``scope_nid``. Emit
-        it as a distinct INFERRED ``indirect_call`` (kept out of the precise ``calls``
-        relation) only when the name resolves to a real callable and is NOT shadowed
-        by a parameter / local binding. A callback defined in another file is deferred
-        to the cross-file resolver via an ``indirect`` raw_call carrying its context.
-        Language-agnostic; shared by the call-argument and dispatch-table capture
-        paths for Python and JS/TS (#1565, #1566).
+    def _emit_indirect_by_name(ident_name: str, loc_node, scope_nid: str,
+                               context: str) -> None:
+        """Resolve a name that is referenced AS A VALUE to a real callable def and emit
+        one INFERRED ``indirect_call`` edge — deferring an unknown / foreign name to the
+        cross-file resolver, which applies the single-definition god-node guard and the
+        GLOBAL callable-target check. The name is already extracted; scope filtering is
+        the CALLER's job: an identifier reference must reject param/local shadows (a bare
+        name IS a binding — see ``_emit_indirect_ref``), whereas a ``getattr(obj, "x")``
+        string names an ATTRIBUTE and is never shadowed by a local, so that path passes
+        the name straight through. ``loc_node`` supplies the source line.
         """
-        if ident is None or ident.type not in ("identifier", "shorthand_property_identifier"):
-            return
-        ident_name = _read_text(ident, source)
-        # shadowing: a param / local binding names a local value, not the module fn
-        if ident_name in enclosing_locals or ident_name in ("self", "cls"):
-            return
         ref_nid = label_to_nid.get(ident_name)
         # Defer to the cross-file resolver when the name is not defined in this file
         # (`from .h import fn`), or resolves to an import-surfaced FOREIGN symbol whose
@@ -4361,7 +4471,7 @@ def _extract_generic(
                 "indirect": True,
                 "context": context,
                 "source_file": str_path,
-                "source_location": f"L{ident.start_point[0] + 1}",
+                "source_location": f"L{loc_node.start_point[0] + 1}",
             })
             return
         if ref_nid == scope_nid or ref_nid not in callable_def_nids:
@@ -4378,9 +4488,27 @@ def _extract_generic(
             "context": context,
             "confidence": "INFERRED",
             "source_file": str_path,
-            "source_location": f"L{ident.start_point[0] + 1}",
+            "source_location": f"L{loc_node.start_point[0] + 1}",
             "weight": 1.0,
         })
+
+    def _emit_indirect_ref(ident, scope_nid: str, enclosing_locals, context: str) -> None:
+        """A function referenced BY NAME — passed as a call argument, or listed as a
+        value in a dispatch table — is an indirect dependency of ``scope_nid``. Emit
+        it as a distinct INFERRED ``indirect_call`` (kept out of the precise ``calls``
+        relation) only when the name resolves to a real callable and is NOT shadowed
+        by a parameter / local binding. A callback defined in another file is deferred
+        to the cross-file resolver via an ``indirect`` raw_call carrying its context.
+        Language-agnostic; shared by the call-argument and dispatch-table capture
+        paths for Python and JS/TS (#1565, #1566).
+        """
+        if ident is None or ident.type not in ("identifier", "shorthand_property_identifier"):
+            return
+        ident_name = _read_text(ident, source)
+        # shadowing: a param / local binding names a local value, not the module fn
+        if ident_name in enclosing_locals or ident_name in ("self", "cls"):
+            return
+        _emit_indirect_by_name(ident_name, ident, scope_nid, context)
 
     def _python_dispatch_value_idents(coll_node):
         """Yield the identifier value-nodes of a dict/list/set/tuple literal that are
@@ -4410,6 +4538,37 @@ def _extract_generic(
             for ch in value_node.children:
                 if ch.type == "identifier":
                     yield ch
+
+    def _getattr_ref_name(call_node):
+        """If ``call_node`` is a builtin ``getattr(obj, "name"[, default])`` whose name
+        argument is a PLAIN string literal, return ``(name, string_node)``: the string
+        names an attribute looked up by that exact name, so it resolves to a callable
+        def of the same label. A dynamic name — a variable, an f-string, a concatenation,
+        any expression — is not statically resolvable and yields ``None`` (no edge is
+        manufactured), as do the 1-arg form and ``obj.getattr(...)`` (a method, not the
+        builtin). Unlike an identifier, a string is an attribute name and is never
+        shadowed by a param/local, so callers resolve it without the shadow guard.
+        """
+        fn = call_node.child_by_field_name("function")
+        if fn is None or fn.type != "identifier" or _read_text(fn, source) != "getattr":
+            return None
+        args = call_node.child_by_field_name("arguments")
+        if args is None:
+            return None
+        positional = [c for c in args.children
+                      if c.is_named and c.type not in ("keyword_argument", "comment")]
+        if len(positional) < 2:
+            return None
+        name_node = positional[1]
+        if name_node.type != "string" or any(
+            ch.type == "interpolation" for ch in name_node.children
+        ):
+            return None  # variable, f-string, concatenation, or expression — dynamic
+        content = next(
+            (ch for ch in name_node.children if ch.type == "string_content"), None)
+        if content is None:
+            return None  # empty string "" — no attribute name
+        return _read_text(content, source), name_node
 
     def _php_class_const_scope(n) -> str | None:
         scope = n.child_by_field_name("scope")
@@ -4689,6 +4848,15 @@ def _extract_generic(
                             _emit_indirect_ref(
                                 arg.child_by_field_name("value"),
                                 caller_nid, enclosing_locals, "argument")
+                # Reflective dispatch: getattr(obj, "handler") names a callable by
+                # string literal (#1566 slice 3). The string is an ATTRIBUTE name, not
+                # an identifier binding, so it is never shadowed by a param/local — it
+                # resolves straight to the callable, bypassing the identifier shadow
+                # guard. A dynamic name (getattr(obj, name)) is unresolvable → no edge.
+                getattr_ref = _getattr_ref_name(node)
+                if getattr_ref is not None:
+                    ref_name, loc = getattr_ref
+                    _emit_indirect_by_name(ref_name, loc, caller_nid, "getattr")
             elif config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript"):
                 # JS/TS: a callback passed by name (`arr.map(fn)`, `setTimeout(fn)`,
                 # `el.addEventListener("x", fn)`). Positional identifier args only —
@@ -4922,6 +5090,13 @@ def _extract_generic(
                 # Module-level alias / re-export: CALLBACK = handler
                 for ident in _python_ref_value_idents(n.child_by_field_name("right")):
                     _emit_indirect_ref(ident, file_nid, module_bound, "assignment")
+            elif n.type == "call":
+                # Module-level reflective dispatch: HANDLER = getattr(mod, "handler")
+                # (#1566 slice 3). Attributed to the file node, like a module table.
+                getattr_ref = _getattr_ref_name(n)
+                if getattr_ref is not None:
+                    ref_name, loc = getattr_ref
+                    _emit_indirect_by_name(ref_name, loc, file_nid, "getattr")
             for c in n.children:
                 _scan_module_dispatch(c)
 
@@ -4960,11 +5135,15 @@ def _extract_generic(
 
     result = {"nodes": nodes, "edges": clean_edges, "raw_calls": raw_calls}
     if callable_def_nids:
-        # Function / method / class def ids in this file. The cross-file
-        # indirect_call resolvers use the union of these to ensure a callback
-        # passed by name resolves only to a real callable, never a same-named
-        # data symbol (mirrors the in-file `callable_def_nids` guard).
-        result["callable_nids"] = sorted(callable_def_nids)
+        # Mark function / method / class defs with a `_callable` attribute so the
+        # cross-file indirect_call pass can resolve a by-name callback only to a real
+        # callable (never a same-named data symbol). A marker rides on the node dict
+        # and survives the id-remap / disambiguation passes in extract(); a pre-remap
+        # id set would go stale and silently drop every cross-file indirect edge when
+        # ids are relativized (#1566 regression). Stripped before output, like origin_file.
+        for n in nodes:
+            if n["id"] in callable_def_nids:
+                n["_callable"] = True
     if swift_extensions:
         result["swift_extensions"] = swift_extensions
     if type_table:
@@ -6542,7 +6721,11 @@ def _augment_systemverilog_semantics(
             body,
             flags=re.DOTALL,
         )
-        for field in re.finditer(r"^\s*([A-Za-z_]\w*(?:\s*#\s*\([^;]+?\))?)\s+\w+\s*;", body_without_functions, re.MULTILINE):
+        # Optional leading class-property qualifiers (rand/local/protected/etc.)
+        # must be consumed: otherwise a qualified field like `rand Config x;`
+        # (three tokens) fails the `<type> <name>;` shape and its type reference
+        # is silently dropped.
+        for field in re.finditer(r"^\s*(?:(?:rand|randc|local|protected|static|const|automatic|var)\s+)*([A-Za-z_]\w*(?:\s*#\s*\([^;]+?\))?)\s+\w+\s*;", body_without_functions, re.MULTILINE):
             # Count to the start of the type token (group 1), not the match
             # start: `^\s*` consumes the leading newline(s), so field.start()
             # would resolve to the class's line instead of the field's.
@@ -7190,19 +7373,39 @@ def extract_julia(path: Path) -> dict:
         # Using / Import
         if t in ("using_statement", "import_statement"):
             line = node.start_point[0] + 1
+
+            def _julia_mod_name(n):
+                # identifier (`Foo`), scoped_identifier (`Base.Threads`), or
+                # import_path (relative `..Sibling`) -> the module name. Only bare
+                # identifiers were handled, so qualified/relative imports — and the
+                # scoped package of a `selected_import` — were silently dropped.
+                if n.type == "import_path":
+                    ids = [c for c in n.children if c.type == "identifier"]
+                    return _read_text(ids[-1], source) if ids else None
+                if n.type in ("identifier", "scoped_identifier"):
+                    return _read_text(n, source)
+                return None
+
+            def _emit_import(name):
+                if not name:
+                    return
+                imp_nid = _make_id(name)
+                add_node(imp_nid, name, line)
+                add_edge(scope_nid, imp_nid, "imports", line, context="import")
+
             for child in node.children:
-                if child.type == "identifier":
-                    mod_name = _read_text(child, source)
-                    imp_nid = _make_id(mod_name)
-                    add_node(imp_nid, mod_name, line)
-                    add_edge(scope_nid, imp_nid, "imports", line, context="import")
+                if child.type in ("identifier", "scoped_identifier", "import_path"):
+                    _emit_import(_julia_mod_name(child))
                 elif child.type == "selected_import":
-                    identifiers = [c for c in child.children if c.type == "identifier"]
-                    if identifiers:
-                        pkg_name = _read_text(identifiers[0], source)
-                        pkg_nid = _make_id(pkg_name)
-                        add_node(pkg_nid, pkg_name, line)
-                        add_edge(scope_nid, pkg_nid, "imports", line, context="import")
+                    # `import Base.Threads: nthreads` — the package (first named
+                    # child) may itself be a scoped_identifier/import_path.
+                    pkg = next(
+                        (c for c in child.children
+                         if c.type in ("identifier", "scoped_identifier", "import_path")),
+                        None,
+                    )
+                    if pkg is not None:
+                        _emit_import(_julia_mod_name(pkg))
             return
 
         for child in node.children:
@@ -7412,6 +7615,19 @@ def extract_fortran(path: Path) -> dict:
                 target_nid = _make_id(stem, callee)
                 add_edge(scope_nid, target_nid, "calls", node.start_point[0] + 1,
                          confidence="EXTRACTED", context="call")
+        # x = compute(args) — function invocations are `call_expression`, which
+        # shares Fortran's `name(...)` syntax with array indexing. Only emit a
+        # call edge when the callee resolves to a procedure defined in this file
+        # (an array variable produces no matching node), so array accesses can't
+        # fabricate spurious `calls` edges.
+        elif t == "call_expression":
+            name_node = next((c for c in node.children if c.type == "identifier"), None)
+            if name_node:
+                callee = _read_text(name_node, source).lower()
+                target_nid = _make_id(stem, callee)
+                if target_nid in seen_ids and target_nid != scope_nid:
+                    add_edge(scope_nid, target_nid, "calls", node.start_point[0] + 1,
+                             confidence="EXTRACTED", context="call")
         for child in node.children:
             walk_calls(child, scope_nid)
 
@@ -8052,6 +8268,66 @@ def extract_rust(path: Path) -> dict:
                                 if tgt != item_nid:
                                     add_edge(item_nid, tgt, "references",
                                              field.start_point[0] + 1, context=ctx)
+                    # Tuple structs (`struct Wrapper(pub Logger, Config);`) nest their
+                    # positional field types directly under ordered_field_declaration_list
+                    # with no field_declaration wrapper -- the same shape handled for tuple
+                    # enum variants below. Without this branch these field type references
+                    # are silently dropped.
+                    for c in node.children:
+                        if c.type != "ordered_field_declaration_list":
+                            continue
+                        fline = c.start_point[0] + 1
+                        for tc in c.children:
+                            if tc.type not in ("type_identifier", "generic_type",
+                                               "scoped_type_identifier", "reference_type",
+                                               "primitive_type", "tuple_type", "array_type"):
+                                continue
+                            refs = []
+                            _rust_collect_type_refs(tc, source, False, refs)
+                            for ref_name, role in refs:
+                                ctx = "generic_arg" if role == "generic_arg" else "field"
+                                tgt = ensure_named_node(ref_name, fline)
+                                if tgt != item_nid:
+                                    add_edge(item_nid, tgt, "references", fline, context=ctx)
+                if t == "enum_item":
+                    # Variant payload types nest under enum_variant_list ->
+                    # enum_variant -> ordered_field_declaration_list (tuple variant,
+                    # `Click(Logger)`) | field_declaration_list (struct variant,
+                    # `Resize { size: Dim }`). Neither was traversed, so every
+                    # enum-variant type reference was silently dropped.
+                    _TYPE_NODES = ("type_identifier", "generic_type",
+                                   "scoped_type_identifier", "reference_type",
+                                   "primitive_type", "tuple_type", "array_type")
+
+                    def _emit_enum_type(type_node, at_line):
+                        if type_node is None:
+                            return
+                        refs2: list[tuple[str, str]] = []
+                        _rust_collect_type_refs(type_node, source, False, refs2)
+                        for ref_name, role in refs2:
+                            ctx = "generic_arg" if role == "generic_arg" else "field"
+                            tgt = ensure_named_node(ref_name, at_line)
+                            if tgt != item_nid:
+                                add_edge(item_nid, tgt, "references", at_line, context=ctx)
+
+                    for c in node.children:
+                        if c.type != "enum_variant_list":
+                            continue
+                        for variant in c.children:
+                            if variant.type != "enum_variant":
+                                continue
+                            vline = variant.start_point[0] + 1
+                            for vc in variant.children:
+                                if vc.type == "ordered_field_declaration_list":
+                                    for tc in vc.children:
+                                        if tc.type in _TYPE_NODES:
+                                            _emit_enum_type(tc, vline)
+                                elif vc.type == "field_declaration_list":
+                                    for field in vc.children:
+                                        if field.type != "field_declaration":
+                                            continue
+                                        type_node = field.child_by_field_name("type")
+                                        _emit_enum_type(type_node, field.start_point[0] + 1)
             return
 
         if t == "impl_item":
@@ -8303,6 +8579,22 @@ def extract_powershell(path: Path) -> dict:
                 class_nid = _make_id(stem, class_name)
                 add_node(class_nid, class_name, line)
                 add_edge(file_nid, class_nid, "contains", line)
+                # Base type(s) after ':'. PowerShell has no syntactic base vs
+                # interface split, so (matching the C# convention) treat the
+                # first base as the superclass (inherits) and the rest as
+                # interfaces (implements). Bases are the simple_name children
+                # after the ':' token.
+                colon_seen = False
+                base_index = 0
+                for child in node.children:
+                    if child.type == ":":
+                        colon_seen = True
+                    elif colon_seen and child.type == "simple_name":
+                        base_nid = ensure_named_node(_read_text(child, source), line)
+                        if base_nid != class_nid:
+                            rel = "inherits" if base_index == 0 else "implements"
+                            add_edge(class_nid, base_nid, rel, line)
+                        base_index += 1
                 for child in node.children:
                     walk(child, parent_class_nid=class_nid)
             return
@@ -8840,9 +9132,27 @@ def _canonicalize_csharp_namespace_nodes(all_nodes: list[dict], all_edges: list[
         all_nodes[:] = [node for node in all_nodes if id(node) not in drop_node_ids]
 
 
-def _node_label_key(node: dict) -> str:
+# Languages whose identifiers are case-insensitive, so cross-file name resolution
+# may fold case. Everywhere else, case is semantic (`Path` the class vs `PATH` the
+# env var are distinct) and folding manufactures false edges / super-hubs (#1581).
+_CASE_INSENSITIVE_EXTS = frozenset({
+    ".php", ".phtml", ".php3", ".php4", ".php5", ".php7", ".phps",  # PHP fns/classes
+    ".sql",                                                          # SQL identifiers
+    ".nim", ".nims", ".nimble",                                      # Nim (style-insensitive)
+})
+
+
+def _lang_is_case_insensitive(source_file: object) -> bool:
+    """True when the file's language resolves identifiers case-insensitively (#1581)."""
+    if not source_file:
+        return False
+    return Path(str(source_file)).suffix.lower() in _CASE_INSENSITIVE_EXTS
+
+
+def _node_label_key(node: dict, fold: bool = False) -> str:
     label = str(node.get("label", "")).strip()
-    return re.sub(r"[^a-zA-Z0-9]+", "", label).lower()
+    key = re.sub(r"[^a-zA-Z0-9]+", "", label)
+    return key.lower() if fold else key
 
 
 def _is_type_like_definition(node: dict) -> bool:
@@ -8860,7 +9170,8 @@ def _is_type_like_definition(node: dict) -> bool:
 
 def _rewire_unique_stub_nodes(nodes: list[dict], edges: list[dict]) -> None:
     """Map unresolved no-source stubs to a unique real definition with the same label."""
-    real_by_label: dict[str, list[dict]] = {}
+    real_by_label: dict[str, list[dict]] = {}       # exact-case (all languages)
+    real_by_label_ci: dict[str, list[dict]] = {}    # case-INSENSITIVE-language reals only
     stubs: list[dict] = []
 
     for node in nodes:
@@ -8869,7 +9180,13 @@ def _rewire_unique_stub_nodes(nodes: list[dict], edges: list[dict]) -> None:
             continue
         if node.get("source_file"):
             if _is_type_like_definition(node):
+                # Match stubs case-SENSITIVELY: a `Path` reference must not rewire to a
+                # `PATH` env var (#1581). Fold only for genuinely case-insensitive
+                # languages, where `foo` legitimately resolves to `Foo`.
                 real_by_label.setdefault(key, []).append(node)
+                if _lang_is_case_insensitive(node.get("source_file")):
+                    real_by_label_ci.setdefault(
+                        _node_label_key(node, fold=True), []).append(node)
             continue
         stubs.append(node)
 
@@ -8880,7 +9197,12 @@ def _rewire_unique_stub_nodes(nodes: list[dict], edges: list[dict]) -> None:
             continue
         candidates = real_by_label.get(_node_label_key(stub), [])
         if len(candidates) != 1:
-            continue
+            # No unique exact match — fall back to a case-insensitive match, but
+            # only against case-insensitive-language definitions (so a case-sensitive
+            # `PATH` can never absorb a `Path` reference).
+            candidates = real_by_label_ci.get(_node_label_key(stub, fold=True), [])
+            if len(candidates) != 1:
+                continue
         target_id = candidates[0].get("id")
         if isinstance(target_id, str) and target_id and target_id != stub_id:
             remap[stub_id] = target_id
@@ -11387,6 +11709,18 @@ def extract_objc(path: Path) -> dict:
                 proto_nid = _make_id(stem, name)
                 add_node(proto_nid, f"<{name}>", line)
                 add_edge(file_nid, proto_nid, "contains", line)
+                # Adopted protocols: `@protocol Derived <Base, Other>`. These
+                # nest under a protocol_reference_list node (distinct from the
+                # parameterized_arguments node used by @interface adoption), so
+                # they were never emitted. Emit an `implements` edge for each,
+                # matching how @interface protocol adoption is handled.
+                for child in node.children:
+                    if child.type == "protocol_reference_list":
+                        for sub in child.children:
+                            if sub.type == "identifier":
+                                base_nid = ensure_named_node(_read(sub), line)
+                                if base_nid != proto_nid:
+                                    add_edge(proto_nid, base_nid, "implements", line)
                 for child in node.children:
                     walk(child, proto_nid)
             return
@@ -15091,15 +15425,15 @@ def extract(
     all_nodes: list[dict] = []
     all_edges: list[dict] = []
     all_raw_calls: list[dict] = []
-    # Union of every file's function / method / class def ids. The cross-file
-    # indirect_call pass resolves a callback passed by name only to one of these,
-    # so a same-named data symbol can never become an indirect-dispatch target.
-    callable_nids: set[str] = set()
     for result in per_file:
         all_nodes.extend(result.get("nodes", []))
         all_edges.extend(result.get("edges", []))
         all_raw_calls.extend(result.get("raw_calls", []))
-        callable_nids.update(result.get("callable_nids", ()))
+    # Function / method / class def ids for the cross-file indirect_call callable
+    # guard. Built from the `_callable` node marker AFTER the id-remap / disambiguation
+    # passes below (which rewrite node ids), so it can never go stale — see the
+    # marker set in the per-file extractor. Populated just before the pass that uses it.
+    callable_nids: set[str] = set()
 
     _augment_symbol_resolution_edges(paths, all_nodes, all_edges, root)
 
@@ -15272,15 +15606,27 @@ def extract(
     # Build label -> node_id index for cross-file call resolution.
     # Skip rationale nodes (their labels are docstring text, not callable
     # identifiers, and they were polluting matches for short names — #563).
-    global_label_to_nids: dict[str, list[str]] = {}
+    global_label_to_nids: dict[str, list[str]] = {}      # exact-case (all languages)
+    global_label_to_nids_ci: dict[str, list[str]] = {}   # case-INSENSITIVE-language nodes
     for n in all_nodes:
         if n.get("file_type") == "rationale" or n.get("type") == "namespace":
             continue
         raw = n.get("label", "")
         normalised = raw.strip("()").lstrip(".")
         if normalised:
-            key = normalised.lower()
-            global_label_to_nids.setdefault(key, []).append(n["id"])
+            # Case is semantic in most languages, so index (and match, below) by exact
+            # case — folding collapses `Path` (class) into `PATH` (env var) and makes a
+            # single shell variable the #1 god-node (#1581). Only case-insensitive
+            # languages (PHP/SQL/Nim) also get a folded key for legitimate fold-matching.
+            global_label_to_nids.setdefault(normalised, []).append(n["id"])
+            if _lang_is_case_insensitive(n.get("source_file")):
+                global_label_to_nids_ci.setdefault(normalised.lower(), []).append(n["id"])
+
+    # Callable-def ids for the indirect_call callable guard, read from the `_callable`
+    # marker on the FINAL (post-remap) nodes — so a callback resolves only to a real
+    # function/method/class, never a same-named data symbol, and the guard never goes
+    # stale when node ids were relativized/disambiguated above (#1566).
+    callable_nids = {n["id"] for n in all_nodes if n.get("_callable")}
 
     # Build evidence index from import edges so cross-file calls backed by an
     # explicit import statement can be promoted from INFERRED to EXTRACTED.
@@ -15334,7 +15680,13 @@ def extract(
         # and collides with any top-level function named "log" in the corpus.
         if rc.get("is_member_call"):
             continue
-        candidates = global_label_to_nids.get(callee.lower(), [])
+        # Exact-case match first (case is semantic). Fold only when the CALLING
+        # file's language is case-insensitive, and only against the folded index of
+        # case-insensitive-language definitions — so a Python `Path()` call can never
+        # resolve to a shell `PATH` node (#1581).
+        candidates = global_label_to_nids.get(callee, [])
+        if not candidates and _lang_is_case_insensitive(rc.get("source_file")):
+            candidates = global_label_to_nids_ci.get(callee.lower(), [])
         if not candidates:
             continue
         caller = rc["caller_nid"]
@@ -15466,6 +15818,7 @@ def extract(
     # cache keeps its own copy, which is what the colliding-id pass reads on a cache hit.
     for n in all_nodes:
         n.pop("origin_file", None)
+        n.pop("_callable", None)  # internal indirect_call marker — never ships to graph.json
 
     # Tag AST provenance so the incremental watch rebuild can distinguish
     # AST-extracted nodes from semantic/LLM nodes. On a full re-extraction
