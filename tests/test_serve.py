@@ -262,7 +262,20 @@ def test_trigram_index_cached_and_rebuilt_per_graph():
 
 
 def test_query_terms_strips_search_punctuation():
-    assert _query_terms("what calls extract?") == ["what", "calls", "extract"]
+    # "what" is a question stopword (dropped); punctuation is still stripped from "extract?".
+    assert _query_terms("what calls extract?") == ["calls", "extract"]
+
+
+def test_query_terms_drops_question_stopwords():
+    # Natural-language question words are dropped so content words drive seeding:
+    # "how does the frontier cache work" must reduce to the content terms, or it
+    # seeds on "how"/"the"/"work" (which prefix-match prose labels) instead.
+    assert _query_terms("how does the frontier cache work") == ["frontier", "cache"]
+
+
+def test_query_terms_all_stopwords_falls_back_to_unfiltered():
+    # An all-stopword query keeps its terms rather than seeding on nothing.
+    assert _query_terms("how does it work") == ["how", "does", "work"]
 
 
 def test_query_terms_filters_only_short_english_terms(monkeypatch):
@@ -632,6 +645,42 @@ def test_pick_seeds_respects_max_k():
     scored = [(10.0, f"n{i}") for i in range(10)]
     seeds = _pick_seeds(scored, max_k=3)
     assert len(seeds) == 3
+
+
+def test_pick_seeds_without_diversity_args_is_unchanged():
+    """G/terms are optional and default to None: existing callers see identical
+    behavior to before this change."""
+    scored = [(1000.0, "fbs"), (1.0, "err1"), (0.9, "err2")]
+    assert _pick_seeds(scored) == ["fbs"]
+
+
+def test_pick_seeds_diversity_recovers_starved_term(monkeypatch):
+    """Reproduces #1445: a vague natural-language query where one term's
+    incidental EXACT match on an unrelated node (e.g. a common word also used
+    as an unrelated field/identifier) outscores every SUBSTRING match on the
+    query's other, actually-relevant terms by ~1000x. Without G/terms, the
+    20%-gap cutoff discards the relevant candidate entirely; with them, it is
+    recovered as a guaranteed per-term seed.
+    """
+    G = nx.DiGraph()
+    # "unrelated" is an exact label match for the query term "unrelated" and
+    # has no connection to the actually-relevant "target" node.
+    G.add_node("noise", label="unrelated", source_file="design_tokens.json")
+    # "target" only substring-matches the query term "widget" via its label.
+    G.add_node("target", label="rate_limit_widget", source_file="src/widget.py")
+    G.add_node("other", label="something_else", source_file="src/other.py")
+    G.add_edge("other", "target")
+
+    terms = ["unrelated", "widget"]
+    scored = _score_nodes(G, terms)
+
+    # Sanity check the premise: without diversity, only the exact match survives.
+    seeds_before = _pick_seeds(scored)
+    assert seeds_before == ["noise"]
+
+    seeds_after = _pick_seeds(scored, G=G, terms=terms)
+    assert "noise" in seeds_after
+    assert "target" in seeds_after
 
 
 # --- actionable truncation hint (#897) ---
