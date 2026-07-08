@@ -100,6 +100,37 @@ def test_extract_disambiguates_duplicate_symbol_ids_by_source_path(tmp_path):
             assert edge["target"] in node_ids, f"Dangling structural target: {edge}"
 
 
+def test_cpp_unresolved_base_class_stubs_stay_disambiguated_by_file(tmp_path):
+    """Two different files' same-named, otherwise-undefined base class must not
+    collapse onto one shared stub node.
+
+    The C++ base_class_clause handler used to build its stub inline instead of
+    calling ensure_named_node(), so it never tagged the stub with origin_file.
+    Without that tag, _disambiguate_colliding_node_ids couldn't tell file A's
+    reference to unresolved `Base` apart from file B's, and every file's
+    unresolved base class merged onto one bare id -- which could then collide
+    with an unrelated same-named real definition anywhere else in the corpus.
+    """
+    first = tmp_path / "a" / "Foo.cpp"
+    second = tmp_path / "b" / "Bar.cpp"
+    first.parent.mkdir(parents=True)
+    second.parent.mkdir(parents=True)
+    first.write_text("class Foo : public Base {};\n", encoding="utf-8")
+    second.write_text("class Bar : public Base {};\n", encoding="utf-8")
+
+    result = extract([first, second], cache_root=tmp_path)
+    base_stubs = [
+        node for node in result["nodes"]
+        if node["label"] == "Base" and not node.get("source_file")
+    ]
+    assert len(base_stubs) == 2
+    assert len({node["id"] for node in base_stubs}) == 2
+
+    inherits_edges = [e for e in result["edges"] if e["relation"] == "inherits"]
+    assert len(inherits_edges) == 2
+    assert len({e["target"] for e in inherits_edges}) == 2
+
+
 def test_cross_file_type_annotation_refs_resolve_to_single_node(tmp_path):
     """#1402: a class defined once but referenced via type annotations in N other
     files must NOT create 1+N phantom duplicate nodes (with the referencing file's
@@ -1813,3 +1844,34 @@ def test_extract_progress_final_line_uses_consistent_denominator(tmp_path, capsy
     # final progress line reports the uncached count (100), not the total (105)
     assert "100/100 uncached files (100%)" in out
     assert "105/105 files" not in out, "final line must not switch to total_files (#1693)"
+
+
+def test_get_extractor_routes_matlab_m_away_from_objc(tmp_path):
+    # #1702: .m is shared by Objective-C and MATLAB. A real ObjC .m still routes to
+    # extract_objc, but a MATLAB .m must NOT be force-parsed by the ObjC grammar
+    # (which produces garbage) — it gets no extractor instead.
+    from graphify.extract import _get_extractor, extract_objc
+
+    objc = tmp_path / "Foo.m"
+    objc.write_text('#import "Foo.h"\n@implementation Foo\n- (void)bar {}\n@end\n')
+    matlab_fn = tmp_path / "solver.m"
+    matlab_fn.write_text("function y = solver(x)\n  y = x + 1;\nend\n")
+    matlab_cls = tmp_path / "Model.m"
+    matlab_cls.write_text("classdef Model\n  methods\n    function run(obj); end\n  end\nend\n")
+    mm = tmp_path / "x.mm"
+    mm.write_text("#import <F/F.h>\n@implementation X\n@end\n")
+
+    assert _get_extractor(objc) is extract_objc            # real ObjC .m -> objc
+    assert _get_extractor(matlab_fn) is None               # MATLAB function -> no garbage
+    assert _get_extractor(matlab_cls) is None              # MATLAB classdef -> no garbage
+    assert _get_extractor(mm) is extract_objc              # .mm is unambiguously ObjC++
+
+
+def test_matlab_m_not_extracted_as_garbage(tmp_path, capsys):
+    # End to end: a MATLAB .m produces no (garbage) nodes and is surfaced by the
+    # no-AST-extractor warning (#1702 + #1689), rather than mis-parsed as ObjC.
+    m = tmp_path / "controller.m"
+    m.write_text("function u = controller(x)\n  u = -x;\nend\n")
+    result = extract([m], cache_root=tmp_path)
+    assert result["nodes"] == []                           # no garbage ObjC nodes
+    assert "no AST extractor" in capsys.readouterr().err    # surfaced, not silent
