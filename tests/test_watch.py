@@ -188,6 +188,138 @@ def test_rebuild_code_writes_community_name(tmp_path):
     )
 
 
+def test_rebuild_code_drops_labels_whose_community_changed(tmp_path):
+    """An incremental rebuild must not reuse a saved label for a community whose
+    membership changed. Labels are keyed by cid, but re-clustering reassigns cids,
+    so after new files land cid N can cover a different community and its old name
+    is then simply wrong. cluster-only guards this with the `.sig` membership
+    fingerprints; _rebuild_code ignored them and hub-filled only *missing* labels,
+    so stale names survived and were written back to labels.json as if current."""
+    import json
+    from graphify.watch import _rebuild_code
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "a.py").write_text(
+        "def alpha():\n    return beta()\n\ndef beta():\n    return 1\n", encoding="utf-8"
+    )
+    assert _rebuild_code(corpus, acquire_lock=False) is True
+
+    out = corpus / "graphify-out"
+    labels_file = out / ".graphify_labels.json"
+    sig_file = out / ".graphify_labels.json.sig"
+    assert sig_file.exists(), "rebuild must persist membership signatures beside labels"
+
+    # Stand in for an LLM naming pass: give every community a distinctive name,
+    # leaving the signatures untouched so they still describe THIS clustering.
+    labels = json.loads(labels_file.read_text(encoding="utf-8"))
+    assert labels, "expected the first rebuild to write community labels"
+    labels_file.write_text(
+        json.dumps({cid: f"Named-{cid}" for cid in labels}), encoding="utf-8"
+    )
+
+    # Grow the corpus so clustering changes, then rebuild incrementally.
+    for name in ("b.py", "c.py", "d.py"):
+        (corpus / name).write_text(
+            f"def {name[0]}_one():\n    return {name[0]}_two()\n\n"
+            f"def {name[0]}_two():\n    return 2\n",
+            encoding="utf-8",
+        )
+    assert _rebuild_code(corpus, acquire_lock=False) is True
+
+    graph = json.loads((out / "graph.json").read_text(encoding="utf-8"))
+    after = json.loads(labels_file.read_text(encoding="utf-8"))
+    sigs = json.loads(sig_file.read_text(encoding="utf-8"))
+
+    communities = {}
+    for node in graph["nodes"]:
+        cid = node.get("community")
+        if cid is not None:
+            communities.setdefault(str(cid), []).append(node["id"])
+
+    from graphify.cluster import community_member_sigs
+    expected = {
+        str(cid): sig
+        for cid, sig in community_member_sigs(
+            {int(c): m for c, m in communities.items()}
+        ).items()
+    }
+    assert sigs == expected, (
+        "signatures must be rewritten in step with the labels; a drifting sidecar "
+        "leaves the staleness guard nothing accurate to check against"
+    )
+
+    # Any surviving "Named-N" must sit on a community that genuinely did not change.
+    for cid, name in after.items():
+        if name.startswith("Named-"):
+            assert cid in communities, f"label kept for vanished community {cid}"
+            assert sigs[cid] == expected[cid], (
+                f"community {cid} kept the stale label {name!r} after its "
+                f"membership changed"
+            )
+
+    for node in graph["nodes"]:
+        cid = node.get("community")
+        if cid is not None and node.get("community_name", "").startswith("Named-"):
+            assert sigs[str(cid)] == expected[str(cid)], (
+                f"node {node['id']} carries stale community_name "
+                f"{node['community_name']!r}"
+            )
+
+
+def test_rebuild_code_keeps_a_visualization_when_over_the_viz_cap(tmp_path, monkeypatch):
+    """Crossing the viz node limit must not leave the project with no graph.html.
+    _rebuild_code used to unlink the existing file and write nothing, so a repo
+    that grew past the cap silently lost its visualization — and the file was
+    already gone by the time the user read the message. The export path falls
+    back to the community-aggregation view in exactly this case; the incremental
+    path should too, so the artifact stays both current and present."""
+    import json
+    from graphify.watch import _rebuild_code
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    # Several *disconnected* clusters: the aggregator declines to render a
+    # single-community meta-graph, so a ring of mutually-importing modules
+    # would collapse to one community and exercise the wrong path.
+    for g in range(4):
+        for i in range(3):
+            other = (i + 1) % 3
+            (corpus / f"g{g}_m{i}.py").write_text(
+                f"import g{g}_m{other}\n\n"
+                + "".join(f"def g{g}_f{i}_{j}():\n    return {j}\n\n" for j in range(4)),
+                encoding="utf-8",
+            )
+    assert _rebuild_code(corpus, acquire_lock=False) is True
+    html = corpus / "graphify-out" / "graph.html"
+    assert html.exists(), "expected a normal (under-cap) rebuild to write graph.html"
+    before = html.read_text(encoding="utf-8")
+
+    # Drop the cap below the graph's size but above its community count — the
+    # real shape of this bug. (A cap under the community count would make the
+    # aggregated meta-graph breach it too, which is a different situation.)
+    graph = json.loads((corpus / "graphify-out" / "graph.json").read_text(encoding="utf-8"))
+    communities = {n.get("community") for n in graph["nodes"] if n.get("community") is not None}
+    cap = (len(communities) + len(graph["nodes"])) // 2
+    assert len(communities) < cap < len(graph["nodes"]), "test corpus cannot exercise the cap"
+    monkeypatch.setenv("GRAPHIFY_VIZ_NODE_LIMIT", str(cap))
+    (corpus / "g9_extra.py").write_text("def extra():\n    return 1\n", encoding="utf-8")
+    assert _rebuild_code(corpus, acquire_lock=False) is True
+
+    assert html.exists(), (
+        "graph.html was deleted when the graph exceeded the viz cap — the "
+        "incremental rebuild must fall back to the aggregated view like export does"
+    )
+    after = html.read_text(encoding="utf-8")
+    assert after != before, "graph.html must be re-rendered, not left stale"
+
+    # And the documented kill switch still means "no viz", not "aggregate".
+    monkeypatch.setenv("GRAPHIFY_VIZ_NODE_LIMIT", "0")
+    (corpus / "g9_extra2.py").write_text("def extra2():\n    return 2\n", encoding="utf-8")
+    assert _rebuild_code(corpus, acquire_lock=False) is True
+    assert not html.exists(), "GRAPHIFY_VIZ_NODE_LIMIT=0 must disable the HTML viz outright"
+
+
 def test_update_rebuilds_with_nested_star_gitignore(tmp_path):
     """#1880: `graphify update` must not emit 0 nodes (and then refuse to
     overwrite) just because the source tree has a nested `.gitignore` with a
@@ -275,6 +407,26 @@ def test_rebuild_honors_persisted_excludes(tmp_path):
     assert not any("vendor/lib.py" in s for s in sources), (
         "rebuild silently re-included an excluded path (#1886)"
     )
+
+
+def test_rebuild_honors_persisted_no_gitignore(tmp_path):
+    import json
+    from graphify.watch import _rebuild_code, _write_build_config
+
+    corpus = tmp_path / "corpus"
+    generated = corpus / "generated"
+    generated.mkdir(parents=True)
+    (corpus / ".gitignore").write_text("generated/\n")
+    (generated / "gen.py").write_text("def generated(): return 1\n")
+    _write_build_config(
+        corpus / "graphify-out", excludes=None, gitignore=False
+    )
+
+    assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
+
+    graph = json.loads((corpus / "graphify-out" / "graph.json").read_text())
+    sources = {Path(str(node.get("source_file", ""))).as_posix() for node in graph["nodes"]}
+    assert any(source.endswith("generated/gen.py") for source in sources)
 
 
 def test_graphify_root_preserves_absolute_when_user_supplied(tmp_path):
@@ -925,9 +1077,9 @@ def test_watch_loads_graphifyignore_once(tmp_path, monkeypatch):
     calls = {"n": 0}
     real_loader = detect_mod._load_graphifyignore
 
-    def counting_loader(root):
+    def counting_loader(root, **kwargs):
         calls["n"] += 1
-        return real_loader(root)
+        return real_loader(root, **kwargs)
 
     # Patch the symbol the watch module imported at module-load time.
     monkeypatch.setattr(watch_mod, "_load_graphifyignore", counting_loader)
@@ -1943,3 +2095,310 @@ def test_rebuild_code_polluted_graph_self_heals_on_full_rebuild(tmp_path):
         "stale AST heading nodes for a semantic-backed doc must self-heal away"
     )
     assert len(after["nodes"]) < nodes_before, "polluted graph should shrink"
+
+
+# ── #2014: code-typed semantic nodes count as a doc's semantic layer ───────────
+
+_CODE_ONLY_GUIDE_IDS = {"parse_config", "load_settings"}
+
+
+def _seed_semantic_doc_graph_code_only(corpus):
+    """Like ``_seed_semantic_doc_graph``, but guide.md's semantic layer is ONLY
+    code-typed nodes — symbols the LLM surfaced from WITHIN the doc (llm.py
+    ``_bind_node_evidence``), with no document/concept node at all (#2014)."""
+    from graphify.watch import _rebuild_code
+
+    corpus.mkdir()
+    (corpus / "app.py").write_text(
+        "def handle_login():\n    return 1\n", encoding="utf-8"
+    )
+    assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
+
+    (corpus / "guide.md").write_text(
+        "# Overview\n\nIntro.\n\n## Setup\n\nSteps.\n\n## Usage\n\nMore.\n",
+        encoding="utf-8",
+    )
+    graph_path = corpus / "graphify-out" / "graph.json"
+    data = json.loads(graph_path.read_text(encoding="utf-8"))
+    code_node_id = next(
+        n["id"] for n in data["nodes"] if n.get("source_file") == "app.py"
+    )
+    data["nodes"].extend([
+        {"id": "parse_config", "label": "parse_config()", "file_type": "code",
+         "source_file": "guide.md"},
+        {"id": "load_settings", "label": "load_settings()", "file_type": "code",
+         "source_file": "guide.md"},
+    ])
+    data["links"].append({
+        "source": "parse_config", "target": code_node_id,
+        "relation": "implemented_by", "confidence": "INFERRED",
+        "source_file": "guide.md",
+    })
+    graph_path.write_text(json.dumps(data), encoding="utf-8")
+    return graph_path
+
+
+def test_rebuild_code_code_only_semantic_doc_not_double_represented_on_full_rebuild(
+    tmp_path,
+):
+    """#2014: a doc represented ONLY by code-typed semantic nodes (symbols
+    surfaced from within it) must be recognized as semantic-backed and skipped
+    by the AST quick-scan. Before the fix "code" was absent from the semantic
+    file_type gate, so the doc was re-AST-scanned — minting heading nodes AND
+    dropping the code-typed semantic nodes (they belonged to a now-rebuilt
+    source), silently losing them."""
+    from graphify.watch import _rebuild_code
+
+    corpus = tmp_path / "corpus"
+    graph_path = _seed_semantic_doc_graph_code_only(corpus)
+
+    assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
+
+    after = json.loads(graph_path.read_text(encoding="utf-8"))
+    after_ids = {n["id"] for n in after["nodes"]}
+    assert _CODE_ONLY_GUIDE_IDS <= after_ids, (
+        "code-typed semantic doc nodes dropped by a full rebuild (#2014)"
+    )
+    assert not (_AST_GUIDE_IDS & after_ids), (
+        "AST heading nodes minted for a code-only semantic-backed doc (#2014)"
+    )
+
+
+# ── #2051: deleted non-AST sources (docs/papers/images) get evicted ────────────
+
+def test_rebuild_code_evicts_semantic_nodes_from_deleted_non_ast_source(tmp_path):
+    """#2051: a full `graphify update` must evict semantic nodes whose non-AST
+    source file (a .txt/.pdf/.png with no code extractor) was deleted from disk.
+    The corpus sweep used to skip every sourceless-of-extractor node, so those
+    nodes survived forever and were served as authoritative long after the file
+    was gone. Disk absence is the only deletion evidence for such sources."""
+    from graphify.watch import _rebuild_code
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "app.py").write_text("def handle():\n    return 1\n", encoding="utf-8")
+    # Two non-AST semantic sources: one stays on disk, one gets deleted.
+    (corpus / "kept.txt").write_text("Design rationale that stays.\n", encoding="utf-8")
+    (corpus / "gone.txt").write_text("Rationale that will be deleted.\n", encoding="utf-8")
+
+    assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
+    graph_path = corpus / "graphify-out" / "graph.json"
+    data = json.loads(graph_path.read_text(encoding="utf-8"))
+    # No LLM in tests, so inject the semantic layer these .txt files would carry.
+    data["nodes"].extend([
+        {"id": "kept_concept", "label": "Kept Concept", "file_type": "concept",
+         "source_file": "kept.txt"},
+        {"id": "gone_concept", "label": "Gone Concept", "file_type": "concept",
+         "source_file": "gone.txt"},
+    ])
+    graph_path.write_text(json.dumps(data), encoding="utf-8")
+
+    # Delete one non-AST source; the other stays.
+    (corpus / "gone.txt").unlink()
+
+    assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
+    after_ids = {n["id"] for n in json.loads(graph_path.read_text(encoding="utf-8"))["nodes"]}
+    assert "gone_concept" not in after_ids, (
+        "semantic node from a deleted non-AST source must be evicted (#2051)"
+    )
+    assert "kept_concept" in after_ids, (
+        "semantic node from a surviving non-AST source must be preserved"
+    )
+
+
+def test_rebuild_code_preserves_remote_source_across_repeated_updates(tmp_path):
+    """#2051 follow-up: a node whose source_file is a URL/virtual scheme
+    (gdoc://, s3://, http://) must survive REPEATED `graphify update`s. Path
+    normalization on the write side collapses the double slash (`gdoc://x` ->
+    `gdoc:/x`), so a literal `"://"` guard matched on the first update but missed
+    on the second, dropping the node into the disk-absence eviction branch
+    (Path('gdoc:/x').exists() is False) — a data-loss regression from the #2051
+    disk-absence sweep. The scheme is now matched with a regex tolerant of the
+    collapse."""
+    from graphify.watch import _rebuild_code, _is_remote_source
+
+    # unit-level: the guard tolerates the slash collapse and rejects local paths
+    assert _is_remote_source("gdoc://abc")
+    assert _is_remote_source("gdoc:/abc")        # collapsed form
+    assert _is_remote_source("s3://bucket/key")
+    assert _is_remote_source("https://example.com/doc")
+    assert not _is_remote_source("src/app.py")
+    assert not _is_remote_source("notes.txt")
+    assert not _is_remote_source("C:/Users/x/a.py")  # Windows drive != scheme
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "app.py").write_text("def handle():\n    return 1\n", encoding="utf-8")
+    assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
+    graph_path = corpus / "graphify-out" / "graph.json"
+    data = json.loads(graph_path.read_text(encoding="utf-8"))
+    data["nodes"].append(
+        {"id": "remote_doc", "label": "Remote Spec", "file_type": "document",
+         "source_file": "gdoc://team/spec"}
+    )
+    graph_path.write_text(json.dumps(data), encoding="utf-8")
+
+    # Three consecutive full updates: the remote node must persist through every
+    # one, even after its stored source_file is normalized to the collapsed form.
+    for i in range(3):
+        assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
+        after = json.loads(graph_path.read_text(encoding="utf-8"))
+        ids = {n["id"] for n in after["nodes"]}
+        assert "remote_doc" in ids, f"remote-source node evicted on update #{i + 1} (#2051 follow-up)"
+
+
+# ── #2056: present-but-unextractable files in a change set are not deletions ───
+
+def test_rebuild_code_incremental_preserves_present_non_ast_source(tmp_path):
+    """#2056: an incremental rebuild whose change set names a file that exists but
+    has no AST extractor (a doc/paper/image, or an excluded path) must NOT treat
+    it as deleted. The old change-set loop routed any present-but-untracked file
+    to _add_deleted_source, evicting its semantic nodes AND flipping
+    had_explicit_deletions so the shrink guard waved the loss through."""
+    from graphify.watch import _rebuild_code
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "app.py").write_text("def handle():\n    return 1\n", encoding="utf-8")
+    (corpus / "spec.txt").write_text("A spec with a semantic layer.\n", encoding="utf-8")
+
+    assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
+    graph_path = corpus / "graphify-out" / "graph.json"
+    data = json.loads(graph_path.read_text(encoding="utf-8"))
+    data["nodes"].append(
+        {"id": "spec_concept", "label": "Spec Concept", "file_type": "concept",
+         "source_file": "spec.txt"}
+    )
+    graph_path.write_text(json.dumps(data), encoding="utf-8")
+
+    # spec.txt is present but not AST-extractable; app.py is a real code change.
+    assert _rebuild_code(
+        corpus, changed_paths=[Path("spec.txt"), Path("app.py")],
+        no_cluster=True, acquire_lock=False,
+    ) is True
+
+    after_ids = {n["id"] for n in json.loads(graph_path.read_text(encoding="utf-8"))["nodes"]}
+    assert "spec_concept" in after_ids, (
+        "present-but-unextractable file in change set wrongly evicted as deleted (#2056)"
+    )
+
+
+# --- #2251: fail-closed load of the existing graph ---
+
+
+def _seed_graph_with_semantic_layer(corpus: Path) -> Path:
+    """Build a real graph for one code file, then inject two semantic nodes
+    (no _origin marker) sourced from a non-AST notes.txt, plus a semantic link.
+    Returns the graph.json path."""
+    from graphify.watch import _rebuild_code
+
+    corpus.mkdir()
+    (corpus / "a.py").write_text("def alpha():\n    return 1\n", encoding="utf-8")
+    (corpus / "notes.txt").write_text("Design notes with a semantic layer.\n",
+                                      encoding="utf-8")
+    assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
+    graph_path = corpus / "graphify-out" / "graph.json"
+    data = json.loads(graph_path.read_text(encoding="utf-8"))
+    assert data["nodes"], "seed rebuild must produce AST code nodes"
+    data["nodes"].extend([
+        {"id": "notes_doc", "label": "Design Notes", "file_type": "document",
+         "source_file": "notes.txt"},
+        {"id": "notes_concept", "label": "Design Concept", "file_type": "concept",
+         "source_file": "notes.txt"},
+    ])
+    data["links"].append({
+        "source": "notes_concept", "target": "notes_doc",
+        "relation": "described_in", "confidence": "INFERRED",
+        "source_file": "notes.txt",
+    })
+    graph_path.write_text(json.dumps(data), encoding="utf-8")
+    return graph_path
+
+
+def test_rebuild_refuses_overwrite_when_existing_graph_over_size_cap(
+    tmp_path, monkeypatch, capsys
+):
+    """#2251: an existing graph.json over GRAPHIFY_MAX_GRAPH_BYTES could not be
+    READ, which is not license to overwrite it. The old code swallowed the cap
+    ValueError, treated the baseline as empty, and collapsed the graph to
+    code-only output."""
+    from graphify.watch import _rebuild_code
+
+    corpus = tmp_path / "corpus"
+    graph_path = _seed_graph_with_semantic_layer(corpus)
+    before = graph_path.read_bytes()
+    assert len(before) > 100
+
+    monkeypatch.setenv("GRAPHIFY_MAX_GRAPH_BYTES", "100")
+    assert _rebuild_code(
+        corpus, changed_paths=[Path("a.py")], no_cluster=True, acquire_lock=False,
+    ) is False
+    assert graph_path.read_bytes() == before, (
+        "graph.json must be byte-identical after a refused over-cap rebuild"
+    )
+    assert "error:" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("no_cluster", [True, False],
+                         ids=["no-cluster", "clustered"])
+def test_rebuild_refuses_overwrite_when_existing_graph_corrupt(
+    tmp_path, capsys, no_cluster
+):
+    """#2251: unparseable graph.json (e.g. truncated by a crash) must fail the
+    rebuild closed on both write paths, not be overwritten as if absent."""
+    from graphify.watch import _rebuild_code
+
+    corpus = tmp_path / "corpus"
+    graph_path = _seed_graph_with_semantic_layer(corpus)
+    truncated = graph_path.read_text(encoding="utf-8")[:40]
+    graph_path.write_text(truncated, encoding="utf-8")
+
+    assert _rebuild_code(
+        corpus, changed_paths=[Path("a.py")],
+        no_cluster=no_cluster, acquire_lock=False,
+    ) is False
+    assert graph_path.read_text(encoding="utf-8") == truncated, (
+        "corrupt graph.json must be left untouched for manual recovery"
+    )
+    assert "error:" in capsys.readouterr().err
+
+
+def test_rebuild_force_does_not_clobber_unreadable_graph(tmp_path, capsys):
+    """#2251: --force means \"accept a shrink\", not \"overwrite a graph that
+    could not be read\"."""
+    from graphify.watch import _rebuild_code
+
+    corpus = tmp_path / "corpus"
+    graph_path = _seed_graph_with_semantic_layer(corpus)
+    truncated = graph_path.read_text(encoding="utf-8")[:40]
+    graph_path.write_text(truncated, encoding="utf-8")
+
+    assert _rebuild_code(
+        corpus, changed_paths=[Path("a.py")], force=True,
+        no_cluster=True, acquire_lock=False,
+    ) is False
+    assert graph_path.read_text(encoding="utf-8") == truncated
+    assert "error:" in capsys.readouterr().err
+
+
+def test_rebuild_readable_graph_still_preserves_semantic_nodes(tmp_path):
+    """Happy-path regression for the #2251 fix: a valid existing graph under the
+    default cap still reconciles — the rebuild succeeds and the semantic layer
+    survives an incremental code-only update."""
+    from graphify.watch import _rebuild_code
+
+    corpus = tmp_path / "corpus"
+    graph_path = _seed_graph_with_semantic_layer(corpus)
+
+    assert _rebuild_code(
+        corpus, changed_paths=[Path("a.py")], no_cluster=True, acquire_lock=False,
+    ) is True
+    after = json.loads(graph_path.read_text(encoding="utf-8"))
+    after_ids = {n["id"] for n in after["nodes"]}
+    assert {"notes_doc", "notes_concept"} <= after_ids, (
+        "semantic nodes must survive an incremental rebuild with a readable graph"
+    )
+    assert any(
+        e.get("source") == "notes_concept" and e.get("target") == "notes_doc"
+        for e in after["links"]
+    ), "semantic link must survive an incremental rebuild"
